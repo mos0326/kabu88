@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable
@@ -207,16 +208,34 @@ def _doc_blocks(docs: list[Document]) -> list[dict]:
     return blocks
 
 
+COMPANY_LINE = re.compile(r"^[-・*\s]*\[?([0-9][0-9A-Z]{3})\]?\s+([^|｜]+?)\s*[|｜]\s*([^|｜]*?)\s*[|｜]\s*(高|中|低|不明)\s*[|｜]\s*(.+)$")
+
+
+def parse_companies(notes: str, limit: int = 8) -> list[dict]:
+    """リサーチメモ末尾の【関連企業】欄（「コード 社名 | 段階 | 関連度 | 根拠」）を読む。読めればAI呼び出しを1回節約できる。"""
+    if "【関連企業】" not in notes:
+        return []
+    out = []
+    for line in notes.split("【関連企業】", 1)[1].splitlines():
+        m = COMPANY_LINE.match(line.strip())
+        if m:
+            out.append({"code": m.group(1), "name": m.group(2).strip(), "segment": m.group(3).strip(),
+                        "exposure": m.group(4), "linkage": m.group(5).strip()})
+    return out[:limit]
+
+
 @dataclass
 class Analyst:
     on_status: Callable[[str], None] = lambda s: None
-    max_searches: int = 8
-    max_fetches: int = 5
+    max_searches: int = 3
+    max_fetches: int = 2
     use_web: bool = True
+    model: str = config.MODEL
     usage: dict = field(default_factory=dict)
     models: set = field(default_factory=set)
     guard_log: list = field(default_factory=list)
     client: anthropic.Anthropic | None = None
+    _basic_tools: bool = False
 
     def __post_init__(self):
         if self.client is None:
@@ -225,14 +244,16 @@ class Analyst:
             self.client = anthropic.Anthropic()
 
     # ------------------------------------------------------------ 低レベル
+    @property
+    def _is_haiku(self) -> bool:
+        return self.model.startswith("claude-haiku")
+
     def _stream(self, **kwargs):
-        with self.client.beta.messages.stream(
-            model=config.MODEL,
-            betas=[FALLBACK_BETA],
-            fallbacks="default",  # 安全判定で断られた場合、サーバー側で推奨モデルに切り替えて再実行
-            system=SYSTEM_PROMPT,
-            **kwargs,
-        ) as stream:
+        extra = {} if self._is_haiku else {
+            "betas": [FALLBACK_BETA],
+            "fallbacks": "default",  # 安全判定で断られた場合、サーバー側で推奨モデルに切り替えて再実行
+        }
+        with self.client.beta.messages.stream(model=self.model, system=SYSTEM_PROMPT, **extra, **kwargs) as stream:
             msg = stream.get_final_message()
         self._add_usage(msg)
         return msg
@@ -255,10 +276,10 @@ class Analyst:
         if msg.stop_reason == "max_tokens":
             raise AIError("AIの出力が長すぎて途中で切れました。対象銘柄数を減らして再実行してください。")
 
-    def _structured(self, prompt: str, schema: dict, effort: str = "high", docs: list[Document] | None = None) -> dict:
+    def _structured(self, prompt: str, schema: dict, effort: str = "medium", docs: list[Document] | None = None) -> dict:
         content = _doc_blocks(docs or []) + [{"type": "text", "text": prompt}]
         msg = self._stream(
-            max_tokens=32000,
+            max_tokens=24000,
             messages=[{"role": "user", "content": content}],
             output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
         )
@@ -274,20 +295,14 @@ class Analyst:
         docs = docs or []
         if not self.use_web and not docs:
             return ""
-        tools = []
-        if self.use_web:
-            tools = [
-                {"type": "web_search_20260209", "name": "web_search", "max_uses": self.max_searches,
-                 "user_location": {"type": "approximate", "country": "JP", "timezone": "Asia/Tokyo"}},
-                {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": self.max_fetches,
-                 "max_content_tokens": 40000},
-            ]
+        tools = self._web_tools(basic=self._is_haiku or self._basic_tools) if self.use_web else []
         messages = [{"role": "user", "content": _doc_blocks(docs) + [{"type": "text", "text": prompt}]}]
         texts: list[str] = []
         try:
             for _ in range(MAX_CONTINUATIONS):
-                msg = self._stream(max_tokens=32000, messages=messages, output_config={"effort": "medium"},
-                                   **({"tools": tools} if tools else {}))
+                # 自動キャッシュ: 検索が途中で止まって再送するとき、前半を1/10の料金で読める
+                msg = self._stream(max_tokens=16000, messages=messages, output_config={"effort": "low"},
+                                   cache_control={"type": "ephemeral"}, **({"tools": tools} if tools else {}))
                 if msg.stop_reason == "refusal":
                     self._check(msg)
                 texts += [b.text for b in msg.content if b.type == "text"]
@@ -298,6 +313,9 @@ class Analyst:
         except anthropic.BadRequestError as e:
             if not tools:
                 raise
+            if not self._basic_tools and not self._is_haiku:  # 新しい版のWebツールに未対応なら基本版で1回だけ再試行
+                self._basic_tools = True
+                return self._research(prompt, docs)
             # 組織の設定でWeb検索が無効な場合など。添付資料があればそれだけで続行する
             self.on_status(f"Web検索/取得を使えませんでした（{e.message}）。")
             if not docs:
@@ -306,6 +324,16 @@ class Analyst:
             return self._research(prompt, docs)
         # リサーチメモも画面に表示し、監査の入力にもなるので、短期予測ガードを通す
         return self._scrub("".join(texts).strip(), "research_notes")
+
+    def _web_tools(self, basic: bool = False) -> list[dict]:
+        if basic:  # 動的フィルタリング版に未対応のモデル向け
+            return [{"type": "web_search_20250305", "name": "web_search", "max_uses": self.max_searches},
+                    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": self.max_fetches,
+                     "max_content_tokens": 15000}]
+        return [{"type": "web_search_20260209", "name": "web_search", "max_uses": self.max_searches,
+                 "user_location": {"type": "approximate", "country": "JP", "timezone": "Asia/Tokyo"}},
+                {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": self.max_fetches,
+                 "max_content_tokens": 15000}]
 
     def _scrub(self, obj, where: str):
         cleaned, log = scrub(obj, where)
@@ -332,7 +360,8 @@ class Analyst:
             THEMES_SCHEMA, effort="low")
         return self._scrub(data.get("themes", []), "themes"), notes
 
-    def research_theme(self, theme: str, include: list[str] | None = None, docs: list[Document] | None = None) -> str:
+    def research_theme(self, theme: str, include: list[str] | None = None, docs: list[Document] | None = None,
+                       max_companies: int = 8) -> str:
         self.on_status("AIがテーマを一次情報（開示資料・統計・ニュース）中心に調べています…")
         inc = f"\nユーザーが必ず含めたい銘柄: {', '.join(include)}" if include else ""
         return self._research(f"""\
@@ -346,9 +375,15 @@ class Analyst:
 2. バリューチェーン: どの工程・部材・サービスに需要が生まれ、どこがボトルネックになるか
 3. 関連する東証上場企業: 決算短信・決算説明資料・有価証券報告書・中期経営計画で、テーマ関連事業の売上規模・受注・設備投資・顧客について何が書かれているか。「関連銘柄」として名前が挙がるだけの企業と、実際に業績へ寄与し始めている企業を区別すること
 4. 逆風・不確実性・テーマが崩れる条件
-最後に、出典（資料名・サイト名・日付）つきの箇条書きメモにまとめてください。株価の予想は書かないでください。""", docs)
+最後に、出典（資料名・サイト名・日付）つきの箇条書きメモにまとめてください。株価の予想は書かないでください。
+メモの最後には、関連する東証上場企業（バリューチェーンの異なる段階から最大{max_companies}社）を次の形式で1行ずつ書いてください。
+【関連企業】
+- 証券コード4桁 社名 | バリューチェーン上の段階 | 関連度（高/中/低/不明） | 関係と根拠""", docs)
 
     def extract_companies(self, theme: str, notes: str, max_companies: int = 8, include: list[str] | None = None) -> list[dict]:
+        parsed = parse_companies(notes, max_companies)
+        if parsed:  # メモの決まった形式から読めたので、AIを呼ばずに済む（料金の節約）
+            return self._scrub(parsed, "companies")
         self.on_status("リサーチメモから関連企業を抽出しています…")
         inc = f"\n- 次の銘柄は必ず含める: {', '.join(include)}" if include else ""
         data = self._structured(f"""\

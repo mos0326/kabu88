@@ -13,12 +13,14 @@ from typing import Callable
 import pandas as pd
 
 from . import config
+from . import jpx
 from .data import fetch_prices, universe_names, yahoo_fundamentals
 from .indicators import price_metrics
 from .jquants import JQuants, JQuantsError, PlanError, code4, num
 
 SRC_YAHOO = "Yahoo Finance"
 SRC_JQ = "J-Quants（JPX公式）"
+SRC_JPX = "JPX公表データ（無料）"
 
 
 def _r(x, nd=2):
@@ -61,8 +63,11 @@ def _guard(bulk: JQBulk, name: str, fn: Callable):
 
 
 def load_bulk(jq: JQuants, with_margin: bool = True) -> JQBulk:
+    """全銘柄一括のAPIを、契約プランで使えるものだけ呼ぶ（Freeプランは12週間遅れなので呼ばない）。"""
     b = JQBulk()
     today = date.today()
+    if not config.JQUANTS_HAS_LATEST:
+        return b
 
     rows = _guard(b, "上場銘柄一覧", lambda: jq.master())
     for r in rows or []:
@@ -74,7 +79,7 @@ def load_bulk(jq: JQuants, with_margin: bool = True) -> JQBulk:
         for r in _guard(b, "バリュエーション指標", lambda: jq.valuation(date_=latest)) or []:
             b.valuation[code4(r["Code"])] = r
 
-    if with_margin:
+    if with_margin and config.JQUANTS_HAS_SUPPLY:
         probe = _guard(b, "信用取引残高", lambda: jq.margin_interest(
             code="7203", from_=(today - timedelta(days=150)).isoformat(), to=today.isoformat()))
         dates = sorted({r["Date"] for r in probe or [] if r.get("Date")})
@@ -122,17 +127,20 @@ def fin_metrics(rows: list[dict], price: float | None = None) -> dict:
         if fy and (num(r.get("FOP")) is not None or num(r.get("FSales")) is not None):
             forecasts.setdefault(fy, []).append({
                 "date": r.get("DiscDate"), "sales": num(r.get("FSales")), "op": num(r.get("FOP")),
-                "np": num(r.get("FNP")), "div": num(r.get("FDivAnn"))})
+                "np": num(r.get("FNP")), "div": num(r.get("FDivAnn")), "eps": num(r.get("FEPS"))})
         nfy = r.get("NxtFYEn") or ""
         if nfy and (num(r.get("NxFOP")) is not None or num(r.get("NxFSales")) is not None):
             forecasts.setdefault(nfy, []).append({
                 "date": r.get("DiscDate"), "sales": num(r.get("NxFSales")), "op": num(r.get("NxFOP")),
-                "np": num(r.get("NxFNp")), "div": num(r.get("NxFDivAnn"))})
+                "np": num(r.get("NxFNp")), "div": num(r.get("NxFDivAnn")), "eps": num(r.get("NxFEPS"))})
 
     out: dict = {}
     if recs:
         out["直近開示日"] = recs[-1].get("DiscDate")
         out["直近開示書類"] = recs[-1].get("DocType")
+    bps = [num(r.get("BPS")) for r in recs if num(r.get("BPS"))]
+    if bps:
+        out["BPS(円)"] = bps[-1]
     last_actual = max(actual) if actual else ""
     hist = sorted(actual)[-3:]
     if hist:
@@ -167,7 +175,30 @@ def fin_metrics(rows: list[dict], price: float | None = None) -> dict:
         out["予想年間配当(円)"] = cur["div"]
         if price:
             out["予想配当利回り%"] = _r(cur["div"] / price * 100)
+    if cur.get("eps"):
+        out["会社予想EPS(円)"] = cur["eps"]
     return out
+
+
+def estimate_next_disclosure(rows: list[dict]) -> dict:
+    """過去の決算短信の開示タイミング（期末から何日後か）から、次の決算発表日を推定する。"""
+    res = [r for r in rows if r.get("CurPerType") in ("1Q", "2Q", "3Q", "FY") and r.get("CurPerEn")
+           and r.get("DiscDate") and num(r.get("Sales")) is not None]
+    if not res:
+        return {}
+    res.sort(key=lambda r: r["DiscDate"])
+    lags = sorted((date.fromisoformat(r["DiscDate"]) - date.fromisoformat(r["CurPerEn"])).days for r in res[-4:])
+    lag = lags[len(lags) // 2]
+    end = date.fromisoformat(res[-1]["CurPerEn"])
+    today = date.today()
+    for _ in range(8):
+        y, m = (end.year + (end.month + 3 - 1) // 12, (end.month + 3 - 1) % 12 + 1)
+        nxt_month = date(y + (m // 12), m % 12 + 1, 1)
+        end = nxt_month - timedelta(days=1)  # 3ヶ月後の月末
+        expected = end + timedelta(days=lag)
+        if expected >= today:
+            return {"次回決算予定日": f"{expected.isoformat()}頃（推定）", "次回決算まで(日)": (expected - today).days}
+    return {}
 
 
 def next_earnings(rows: list[dict]) -> dict:
@@ -274,12 +305,17 @@ def environment(prices: dict[str, pd.DataFrame], bulk: JQBulk | None) -> dict:
     return env
 
 
+def _jpx_row(r: dict | None, d: str | None) -> dict | None:
+    return None if not r else {"LongVol": r["LongVol"], "ShrtVol": r["ShrtVol"], "Date": d}
+
+
 def build_snapshots(
     codes: list[str],
     names: dict[str, str] | None = None,
     demo: bool | None = None,
     use_jquants: bool = True,
     on_status: Callable[[str], None] = lambda s: None,
+    use_jpx: bool = True,
 ) -> tuple[list[dict], dict, list[str], dict[str, pd.DataFrame]]:
     """銘柄ごとの数値スナップショット・相場環境・データ不足の一覧・株価データを返す。"""
     demo = config.DEMO_MODE if demo is None else demo
@@ -292,12 +328,30 @@ def build_snapshots(
 
     jq = bulk = None
     if use_jquants and config.has_jquants() and not demo:
-        on_status("J-Quants（JPX公式）からバリュエーション・信用残・空売りデータを取得しています…")
+        on_status(f"J-Quants（{config.JQUANTS_PLAN}プラン）から決算短信などのデータを取得しています…")
         jq = JQuants()
         bulk = load_bulk(jq)
+        if not config.JQUANTS_HAS_LATEST:
+            gaps.append("J-Quants Freeプランのため、決算短信の数値は12週間遅れです（直近の決算が反映されていない可能性）。"
+                        "予想PER・PBRは会社予想EPS・BPS × 現在の株価で計算しています。")
     else:
-        gaps.append("J-Quants未接続のため、信用残・空売り・決算短信の数値（会社予想・進捗率・修正履歴）はありません。"
-                    "PER/PBR等は Yahoo Finance の値です。")
+        gaps.append("J-Quants未接続のため、決算短信の数値（会社予想・進捗率・修正履歴）はありません。"
+                    "PER/PBR等は Yahoo Finance の値です（予想PERはアナリスト予想ベースで、会社予想と異なる場合があります）。")
+
+    jpx_margin = jpx_short = None
+    if use_jpx and config.USE_JPX_FREE and not demo:
+        if not (bulk and bulk.margin):
+            try:
+                jpx_margin = jpx.margin_balances(on_status)
+            except Exception as e:  # サイトの構成変更などで取れなくても止めない
+                gaps.append(f"JPXの銘柄別信用残を取得できませんでした（{e}）。")
+        if not (jq and config.JQUANTS_HAS_SUPPLY):
+            try:
+                jpx_short = jpx.short_positions(on_status)
+            except Exception as e:
+                gaps.append(f"JPXの空売り残高を取得できませんでした（{e}）。")
+    elif not (bulk and bulk.margin):
+        gaps.append("信用残・空売りのデータはありません（デモモード、またはJPX無料データを無効にしています）。")
 
     env = environment(prices, bulk)
     bench = prices.get(config.BENCHMARK)
@@ -339,29 +393,55 @@ def build_snapshots(
 
         # 業績（決算短信）・イベント・需給
         snap["業績"], snap["イベント"], snap["需給"] = {}, {}, {}
-        if jq and bulk:
+        if jq and bulk is not None:
             fins = _guard(bulk, "財務情報", lambda: jq.fins_summary(code))
             if fins:
-                snap["業績"] = fin_metrics(fins, price=pm["終値"])
-                snap["出典"]["業績"] = f"{SRC_JQ} 決算短信（{snap['業績'].get('直近開示日')}開示）"
-                if "予想配当利回り%" in snap["業績"]:
-                    snap["バリュエーション"]["配当利回り%(会社予想)"] = snap["業績"]["予想配当利回り%"]
-            ed = _guard(bulk, "決算発表予定日", lambda: jq.earnings_date(code))
-            if ed:
-                snap["イベント"] = next_earnings(ed)
-            mm = margin_metrics(bulk.margin.get(code), bulk.margin_prev.get(code), pm["25日平均出来高"])
-            if mm:
-                snap["需給"].update(mm)
-                snap["出典"]["信用残"] = f"{SRC_JQ}（{mm['信用残基準日']}）"
-            today = date.today()
-            ss = _guard(bulk, "空売り残高報告", lambda: jq.short_sale_report(
-                code, (today - timedelta(days=120)).isoformat(), today.isoformat()))
-            if ss is not None:
-                snap["需給"].update(short_sale_metrics(ss))
+                fm = fin_metrics(fins, price=pm["終値"])
+                snap["業績"] = fm
+                snap["出典"]["業績"] = f"{SRC_JQ} 決算短信（{fm.get('直近開示日')}開示）"
+                if "予想配当利回り%" in fm:
+                    snap["バリュエーション"]["配当利回り%(会社予想)"] = fm["予想配当利回り%"]
+                if not vrow:  # Freeプラン: 会社予想EPS・BPS × 現在株価で計算（Yahooのアナリスト予想より信頼できる）
+                    if fm.get("会社予想EPS(円)") and fm["会社予想EPS(円)"] > 0:
+                        snap["バリュエーション"]["予想PER"] = _r(pm["終値"] / fm["会社予想EPS(円)"])
+                    if fm.get("BPS(円)") and fm["BPS(円)"] > 0:
+                        snap["バリュエーション"]["PBR"] = _r(pm["終値"] / fm["BPS(円)"])
+                    snap["出典"]["バリュエーション"] = (f"予想PER・PBRは{SRC_JQ}の会社予想EPS・BPS×現在株価で計算。"
+                                                f"その他は{SRC_YAHOO}")
+            if config.JQUANTS_HAS_LATEST:
+                ed = _guard(bulk, "決算発表予定日", lambda: jq.earnings_date(code))
+                if ed:
+                    snap["イベント"] = next_earnings(ed)
+            if not snap["イベント"] and fins:
+                snap["イベント"] = estimate_next_disclosure(fins)
+            if bulk.margin:
+                mm = margin_metrics(bulk.margin.get(code), bulk.margin_prev.get(code), pm["25日平均出来高"])
+                if mm:
+                    snap["需給"].update(mm)
+                    snap["出典"]["信用残"] = f"{SRC_JQ}（{mm['信用残基準日']}）"
+            if config.JQUANTS_HAS_SUPPLY:
+                today = date.today()
+                ss = _guard(bulk, "空売り残高報告", lambda: jq.short_sale_report(
+                    code, (today - timedelta(days=120)).isoformat(), today.isoformat()))
+                if ss is not None:
+                    snap["需給"].update(short_sale_metrics(ss))
             s33 = str(m.get("S33", ""))
             if s33 in bulk.short_ratio:
                 snap["需給"]["業種空売り比率%"] = bulk.short_ratio[s33]
                 snap["出典"]["空売り比率"] = f"{SRC_JQ}（{bulk.short_ratio_date}）"
+        if jpx_margin and jpx_margin[0]:
+            jd, latest, prev = jpx_margin
+            mm = margin_metrics(_jpx_row(latest.get(code), jd), _jpx_row(prev.get(code), None), pm["25日平均出来高"])
+            if mm:
+                if latest[code].get("LongToListed"):
+                    mm["買残/上場株数%"] = latest[code]["LongToListed"]
+                mm["買残前日比(株)"] = latest[code].get("LongChg")
+                snap["需給"].update(mm)
+                snap["出典"]["信用残"] = f"{SRC_JPX}（{jd}申込分）"
+        if jpx_short and jpx_short[0]:
+            span, by_code = jpx_short
+            snap["需給"].update(short_sale_metrics(by_code.get(code, [])))
+            snap["出典"]["空売り残高"] = f"{SRC_JPX}（{span}の報告から集計・それ以前の報告は含まない）"
 
         snap["flags"] = flags_for(snap)
         snaps.append(snap)
@@ -383,10 +463,17 @@ def universe_table(demo: bool | None = None, use_jquants: bool = True,
     prices = fetch_prices([s.ticker for s in stocks], demo=demo)
     gaps: list[str] = []
     bulk = None
-    if use_jquants and config.has_jquants() and not demo:
+    if use_jquants and config.has_jquants() and not demo and config.JQUANTS_HAS_LATEST:
         on_status("J-Quants から全銘柄のバリュエーション・信用残を取得しています…")
         bulk = load_bulk(JQuants())
         gaps += [f"J-Quants「{k}」: {v}" for k, v in bulk.unavailable.items()]
+    jpx_margin = None
+    if not (bulk and bulk.margin) and config.USE_JPX_FREE and not demo:
+        try:
+            jpx_margin = jpx.margin_balances(on_status)
+            gaps.append(f"信用残は {SRC_JPX}（{jpx_margin[0]}申込分）です。")
+        except Exception as e:
+            gaps.append(f"JPXの銘柄別信用残を取得できませんでした（{e}）。")
     rows = []
     for s in stocks:
         df = prices.get(s.ticker)
@@ -405,11 +492,16 @@ def universe_table(demo: bool | None = None, use_jquants: bool = True,
             mm = margin_metrics(bulk.margin.get(s.code), bulk.margin_prev.get(s.code), pm["25日平均出来高"])
             snap["需給"] = mm
             row.update({k: mm.get(k) for k in ("信用倍率", "買残/出来高(日)", "買残4週変化%")})
+        elif jpx_margin and jpx_margin[0]:
+            jd, latest, prev = jpx_margin
+            mm = margin_metrics(_jpx_row(latest.get(s.code), jd), _jpx_row(prev.get(s.code), None), pm["25日平均出来高"])
+            snap["需給"] = mm
+            row.update({k: mm.get(k) for k in ("信用倍率", "買残/出来高(日)", "買残4週変化%")})
         fl = flags_for(snap)
         row["警告"] = sum(1 for x in fl if x["level"] == "警告")
         row["注意"] = sum(1 for x in fl if x["level"] == "注意")
         row["フラグ"] = " / ".join(x["text"] for x in fl if x["level"] != "情報")
         rows.append(row)
     if not bulk:
-        gaps.append("J-Quants未接続のため、PER/PBR・信用残の列はありません（個別の分析では Yahoo Finance の値を使います）。")
+        gaps.append("PER/PBRの列は J-Quants（Light以上）接続時のみ表示します。個別の分析では会社予想EPSや Yahoo Finance の値を使います。")
     return pd.DataFrame(rows), gaps

@@ -7,6 +7,10 @@ venv/
 .streamlit/secrets.toml
 .DS_Store
 
-# 分析履歴・判断メモは個人のデータなので既定ではコミットしない（残したい場合はこの2行を消す）
+# 分析結果・レポート・判断メモ・キャッシュは個人のデータなので git に含めない
+# （このリポジトリは公開設定です。残したい場合は非公開リポジトリにしてから行を消してください）
 data/runs/*.json
+data/runs/pending/
 data/decisions.json
+data/cache/
+reports/

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from kabu import config, store
+from kabu import config, costs, store
 from kabu.ai import AIError, Document
 from kabu.charts import candle
 from kabu.data import fetch_prices, load_universe
@@ -20,8 +20,6 @@ from kabu.quant import universe_table
 
 st.set_page_config(page_title="kabu88 テーマ分析・監査", page_icon="🧭", layout="wide")
 
-# 料金の目安（Claude Opus 5.5, USD / 100万トークン）
-PRICE_IN, PRICE_OUT = 4.0, 20.0
 EXAMPLE_THEMES = [
     "AIデータセンター拡大による液冷需要",
     "データセンター向け電力インフラ（変圧器・送配電）",
@@ -71,34 +69,51 @@ with st.sidebar:
     st.caption("中長期テーマの調査と、数値にもとづく監査")
 
     st.subheader("接続状況")
-    st.write(("✅" if config.has_api_key() else "❌") + " Claude API（分析・監査）")
     demo = st.toggle("デモモード（合成データ）", value=config.DEMO_MODE,
                      help="ネットに繋がずに画面を確認するモード。株価・指標は架空です。")
-    st.write("🧪 デモデータ" if demo else "✅ Yahoo Finance（株価・PER/PBR）")
+    st.write("🧪 デモデータ" if demo else "✅ Yahoo Finance（株価・PER/PBR）無料")
+    if not demo and config.USE_JPX_FREE:
+        st.write("✅ JPX公表データ（信用残・空売り残高）無料")
+    st.write(("✅" if config.has_api_key() else "➖") + " Claude API（従量課金・任意）")
     if config.has_jquants():
-        st.write("✅ J-Quants（JPX公式: 決算短信・信用残・空売り）")
+        st.write(f"✅ J-Quants（{config.JQUANTS_PLAN}プラン）")
         if st.button("J-Quants 接続テスト", width="stretch"):
             with st.spinner("確認しています…"):
                 st.session_state["jq_access"] = jquants_access()
         for k, v in st.session_state.get("jq_access", {}).items():
             st.caption(f"{'✅' if v.startswith('利用可') else '⚠️'} {k}: {v}")
     else:
-        st.write("➖ J-Quants 未設定（信用残・空売り・会社予想なし）")
-    st.caption(f"モデル: `{config.MODEL}`")
+        st.write("➖ J-Quants 未設定（会社予想・進捗率なし）")
 
-    st.subheader("分析の設定")
-    max_companies = st.slider("テーマ分析で調べる企業数（最大）", 3, 12, 8)
+    st.subheader("💴 料金")
+    spent = costs.month_spend(store.load_runs())
+    budget = config.MONTHLY_BUDGET_USD
+    st.markdown(f"今月の Claude API 料金（目安）: **${spent:.2f}**"
+                + (f" ／ 上限 ${budget:.2f}" if budget > 0 else " ／ 上限なし"))
+    if budget > 0:
+        st.progress(min(1.0, spent / budget))
+    st.caption("Claude Code で `/kabu-theme` を使えば API料金は0円です（サブスクの範囲内）。")
+
+    st.subheader("API実行の設定")
+    models = list(costs.MODEL_LABELS)
+    model = st.selectbox("モデル", models, index=models.index(config.MODEL) if config.MODEL in models else 0,
+                         format_func=lambda m: costs.MODEL_LABELS[m])
+    max_companies = st.slider("テーマ分析で調べる企業数（最大）", 2, 10, 5)
     use_web = st.toggle("Web検索・Web取得で一次情報を調べる", value=True)
-    max_searches = st.slider("Web検索の最大回数", 1, 20, 8, disabled=not use_web)
-    max_fetches = st.slider("Webページ・PDF取得の最大回数", 0, 10, 5, disabled=not use_web)
+    max_searches = st.slider("Web検索の最大回数（1回 約1.5円）", 1, 10, 3, disabled=not use_web)
+    max_fetches = st.slider("Webページ・PDF取得の最大回数", 0, 5, 2, disabled=not use_web)
     use_jq = st.toggle("J-Quants の数値を使う", value=config.has_jquants(), disabled=not config.has_jquants())
     attach_tdnet = st.toggle("決算短信PDFを自動取得してAIに読ませる", value=False, disabled=not config.has_jquants(),
                              help="J-Quants の TDnet/適時開示情報アドオンが必要です。PDFを読むぶんトークン料金が増えます。")
-    tdnet_max = st.slider("決算短信を読ませる企業数", 1, 8, 3, disabled=not attach_tdnet)
+    tdnet_max = st.slider("決算短信を読ませる企業数", 1, 5, 2, disabled=not attach_tdnet)
     extra = st.text_area("AIに追加で見てほしい観点（任意）", placeholder="例: 為替感応度を重視 / 配当方針も確認して")
+    est = costs.estimate(model, use_web, max_searches, max_fetches, max_companies, tdnet_max if attach_tdnet else 0)
+    st.caption(f"1回あたりの料金の目安: 最大 約${est:.2f}（約{est * 155:.0f}円）")
 
 settings = Settings(max_companies=max_companies, use_web=use_web, max_searches=max_searches, max_fetches=max_fetches,
-                    use_jquants=use_jq, attach_tdnet=attach_tdnet, tdnet_max=tdnet_max, extra=extra, demo=demo)
+                    use_jquants=use_jq, attach_tdnet=attach_tdnet, tdnet_max=tdnet_max, extra=extra, demo=demo,
+                    model=model)
+over_budget = budget > 0 and spent >= budget
 
 st.info("このツールのAIは**株価を当てません**。短期の値動き・目標株価・売買の指示は出さず、"
         "中長期テーマの調査と、外部APIの数値（バリュエーション・需給・過熱）による監査に徹します。判断するのはあなたです。",
@@ -171,8 +186,9 @@ def render_company(c: dict, run: dict, key: str) -> None:
 def render_run(run: dict, key: str) -> None:
     ov = run.get("theme_overview", {})
     st.subheader(f"{ov.get('title') or run.get('theme') or '個別銘柄の監査'}")
-    st.caption(f"{run['created_at'][:16].replace('T', ' ')} ・ 時間軸: {ov.get('horizon', '-')} ・ "
-               f"モデル: {', '.join(run.get('models', []))}" + (" ・ 🧪デモ" if run.get("demo") else ""))
+    src = "Claude Code（API料金なし）" if run.get("source") == "claude-code" else f"Claude API（{', '.join(run.get('models', []))}）"
+    st.caption(f"{run['created_at'][:16].replace('T', ' ')} ・ 時間軸: {ov.get('horizon', '-')} ・ 実行: {src}"
+               + (" ・ 🧪デモ" if run.get("demo") else ""))
     if ov.get("thesis"):
         st.markdown(ov["thesis"])
     c1, c2, c3 = st.columns(3)
@@ -226,10 +242,12 @@ def render_run(run: dict, key: str) -> None:
             st.dataframe(pd.DataFrame(run["guard_log"]), hide_index=True, width="stretch")
     u = run.get("usage", {})
     if u:
-        cost = (u.get("input_tokens", 0) * PRICE_IN + u.get("output_tokens", 0) * PRICE_OUT) / 1e6
+        cost = run.get("cost_usd") if run.get("cost_usd") is not None else costs.usage_cost(u, run.get("models"))
         st.caption(f"入力 {u.get('input_tokens', 0):,} / 出力 {u.get('output_tokens', 0):,} トークン ・ "
                    f"Web検索 {u.get('web_search_requests', 0)} 回 ・ Web取得 {u.get('web_fetch_requests', 0)} 回 ・ "
-                   f"トークン料金の目安 約${cost:.2f}（検索・取得の料金は別）")
+                   f"料金の目安 約${cost:.3f}（約{cost * 155:.0f}円）")
+    if run.get("_report"):
+        st.caption(f"Markdownレポート: `{run['_report']}`")
 
 
 def uploaded_docs(files) -> list[Document]:
@@ -252,6 +270,25 @@ def run_with_status(label: str, fn):
 
 
 need_key = not config.has_api_key()
+blocked = need_key or over_budget
+CLAUDE_CODE_HINT = ("💡 **API料金をかけない方法**: Claude Code でこのリポジトリを開き、`/kabu-theme テーマ名`（個別銘柄は "
+                    "`/kabu-audit 6857 5803`、テーマ提案は `/kabu-themes`）と入力すると、サブスクリプションの範囲内で同じ分析ができます。"
+                    "結果は「🗂 履歴と検証」タブに表示されます。")
+
+
+def api_notice() -> None:
+    if over_budget:
+        st.error(f"今月の Claude API 料金が上限（${budget:.2f}）に達したため、ボタンからのAI実行を止めています。"
+                 "`.env` の KABU_MONTHLY_BUDGET_USD で変更できます。")
+    elif need_key:
+        st.caption("Claude API キー（`.env` の `ANTHROPIC_API_KEY`）を設定すると、このボタンから直接実行できます（従量課金）。")
+
+
+def recent_same_theme(theme: str):
+    for r in store.load_runs():
+        if r.get("theme") == theme and (pd.Timestamp.now() - pd.Timestamp(r["created_at"])).days < 7:
+            return r
+    return None
 tab_theme, tab_audit, tab_quant, tab_hist, tab_univ = st.tabs(
     ["🧭 テーマ分析", "🔍 個別銘柄の監査", "📊 数値チェック（AIなし）", "🗂 履歴と検証", "⚙️ 銘柄リスト"])
 
@@ -259,14 +296,13 @@ tab_theme, tab_audit, tab_quant, tab_hist, tab_univ = st.tabs(
 with tab_theme:
     st.header("中長期テーマから関連企業を調べる")
     st.caption("テーマ → 一次情報（決算短信・有報・統計・ニュース）の調査 → 関連企業の抽出 → 外部APIの数値取得 → AIが監査")
-    if need_key:
-        st.error("Claude API キーを `.env` の `ANTHROPIC_API_KEY` に設定すると使えます。")
+    st.success(CLAUDE_CODE_HINT)
 
     with st.expander("💡 テーマが決まっていない場合: AIにテーマを提案させる"):
         f1, f2 = st.columns([4, 1], vertical_alignment="bottom")
         focus = f1.text_input("関心のある分野（任意）", placeholder="例: エネルギー、内需、素材")
         n_themes = f2.number_input("提案数", 2, 8, 4)
-        if st.button("AIにテーマを提案させる", disabled=need_key or not use_web):
+        if st.button("AIにテーマを提案させる（API）", disabled=blocked or not use_web):
             res = run_with_status("テーマを探しています…", lambda cb: propose_themes(int(n_themes), focus, settings, on_status=cb))
             if res:
                 st.session_state["proposed"] = res
@@ -291,7 +327,12 @@ with tab_theme:
     include = st.text_input("必ず含めたい銘柄（任意・証券コード）", placeholder="例: 6367 6501")
     files = st.file_uploader("AIに読ませる資料（任意・PDF）: 決算短信・有価証券報告書・決算説明資料など",
                              type=["pdf"], accept_multiple_files=True, key="theme_files")
-    if st.button("🧭 このテーマを分析する", type="primary", disabled=need_key or not theme.strip()):
+    same = recent_same_theme(theme.strip()) if theme.strip() else None
+    if same:
+        st.info(f"このテーマは {same['created_at'][:10]} に分析済みです（「🗂 履歴と検証」タブで無料で見られます）。")
+    api_notice()
+    st.caption(f"料金の目安: 最大 約${est:.2f}（約{est * 155:.0f}円）")
+    if st.button("🧭 このテーマを分析する（API）", type="primary", disabled=blocked or not theme.strip()):
         res = run_with_status("分析しています…", lambda cb: analyze_theme(theme.strip(), include, uploaded_docs(files), settings, on_status=cb))
         if res:
             st.session_state["theme_run"] = res
@@ -303,12 +344,14 @@ with tab_theme:
 with tab_audit:
     st.header("気になる銘柄を監査する")
     st.caption("外部APIの数値（バリュエーション・需給・過熱・会社予想）を取得し、開示資料やニュースと突き合わせて、楽観的な見方に反証を当てます。")
+    st.success(CLAUDE_CODE_HINT)
     uni = load_universe()
     sel = st.multiselect("銘柄リストから選ぶ", [f"{s.code} {s.name}" for s in uni], max_selections=10)
     free = st.text_input("または証券コードを入力（スペース区切り）", placeholder="例: 6857 5803 285A", key="audit_codes")
     codes = [x.split()[0] for x in sel] + free.split()
     files2 = st.file_uploader("AIに読ませる資料（任意・PDF）", type=["pdf"], accept_multiple_files=True, key="audit_files")
-    if st.button("🔍 監査する", type="primary", disabled=need_key or not codes):
+    api_notice()
+    if st.button("🔍 監査する（API）", type="primary", disabled=blocked or not codes):
         res = run_with_status("監査しています…", lambda cb: audit_stocks(codes, uploaded_docs(files2), settings, on_status=cb))
         if res:
             st.session_state["audit_run"] = res

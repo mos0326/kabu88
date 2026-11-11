@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
 from datetime import date, timedelta
@@ -89,12 +91,20 @@ class JQuants:
             return r.json()
         raise JQuantsError(f"{path}: リクエストが混み合っています（レート制限）。時間をおいて再実行してください。")
 
+    # 決算短信などは頻繁に変わらないので、ディスクにも保存してリクエスト数を節約する
+    DISK_TTL_HOURS = {"/fins/summary": 12, "/fins/earnings-date": 12, "/equities/master": 24 * 7}
+
     def get(self, path: str, **params) -> list[dict]:
-        """data 配列をページネーションしながら全件取得する（結果はインスタンス内でキャッシュ）。"""
+        """data 配列をページネーションしながら全件取得する（結果はメモリとディスクにキャッシュ）。"""
         params = {k.rstrip("_"): v for k, v in params.items() if v not in (None, "")}
         key = (path, tuple(sorted(params.items())))
         if key in self._cache:
             return self._cache[key]  # type: ignore[return-value]
+        disk = self._disk_path(key) if path in self.DISK_TTL_HOURS else None
+        if disk and disk.exists() and time.time() - disk.stat().st_mtime < self.DISK_TTL_HOURS[path] * 3600:
+            rows = json.loads(disk.read_text(encoding="utf-8"))
+            self._cache[key] = rows
+            return rows
         rows: list[dict] = []
         while True:
             body = self._request(path, params)
@@ -104,7 +114,15 @@ class JQuants:
                 break
             params = {**params, "pagination_key": nxt}
         self._cache[key] = rows
+        if disk:
+            disk.parent.mkdir(parents=True, exist_ok=True)
+            disk.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
         return rows
+
+    @staticmethod
+    def _disk_path(key: tuple):
+        h = hashlib.sha1(repr(key).encode()).hexdigest()[:16]
+        return config.DATA_DIR / "cache" / "jquants" / f"{key[0].strip('/').replace('/', '_')}_{h}.json"
 
     # ------------------------------------------------------------ 各API
     def master(self, code: str | None = None, date_: str | None = None) -> list[dict]:
